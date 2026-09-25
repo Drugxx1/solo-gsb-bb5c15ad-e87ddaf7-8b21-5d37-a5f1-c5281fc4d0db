@@ -101,7 +101,10 @@
   因此常规申请 / 续期 / 释放只需读取汇总即可核算剩余容量，不再遍历
   占用集合下的全部有效 member。
 - 首次遇到"占用集合非空但缺少汇总"（升级前写入的数据）时，脚本在同一次
-  调用内遍历一次重建汇总，兼容升级；汇总损坏（非整数或为负）同样重建。
+  调用内遍历一次重建汇总，兼容升级；汇总只接受非负整数字符串，
+  小数（如 "1.5"）、负值或其他非数字内容一律视为损坏——先按服务器时间
+  移除到期槽位，再从剩余有效成员重建整数汇总并同步兜底 TTL，
+  避免损坏值被当作有效汇总（申请路径的 INCRBY 会对小数直接报错）。
 - 占用集合自然过期（兜底 PEXPIRE 到期）或清空时，汇总键与集合键同时
   DEL（非空时二者设置相同的兜底 PEXPIRE），汇总不会在集合消失后残留，
   避免后续申请被旧计数阻挡。
@@ -944,7 +947,7 @@ return {0, remaining, reset_at, retry_after}
 """
 
 # 并发容量公共头：服务器时间、占用 ZSet 与已占用权重汇总的联动维护
-# （清旧逐笔扣减、申请 / 释放同步增减、缺汇总时一次性重建），
+# （清旧逐笔扣减、申请 / 释放同步增减、缺汇总或汇总损坏时一次性重建），
 # 以及占用集合与汇总键的兜底 TTL 回收。拼接到每个容量脚本前，
 # 保证四个脚本的"清旧 -> 核算 -> 回收"口径逐字一致。
 _CAPACITY_LUA = """
@@ -959,7 +962,7 @@ local function member_weight(member)
   return tonumber(string.match(member, ':(%d+)$'))
 end
 
--- 遍历占用集合逐项累计权重（仅用于升级兼容的汇总一次性重建）
+-- 遍历占用集合逐项累计权重（仅用于升级兼容 / 汇总损坏时的一次性重建）
 local function sum_slot_weights(key)
   local used = 0
   local members = redis.call('ZRANGE', key, 0, -1)
@@ -967,6 +970,22 @@ local function sum_slot_weights(key)
     used = used + member_weight(m)
   end
   return used
+end
+
+-- 汇总只接受非负整数字符串（与 INCRBY 的解析口径一致）：
+-- 小数（如 "1.5"）、负值、空白 / 科学计数法等 tonumber 能转换但
+-- INCRBY 会拒绝的内容，以及超出可精确表示范围的整数，一律视为损坏——
+-- 它们不能作为核算依据（申请路径的 INCRBY 会对小数直接报错，
+-- 到期扣减也会沿用错误值），必须由调用方从占用集合重建
+local function parse_slot_used(stored)
+  if not stored or not string.match(stored, '^%d+$') then
+    return nil
+  end
+  local num = tonumber(stored)
+  if not num or num >= 2^53 then
+    return nil
+  end
+  return num
 end
 
 -- 状态变更后的兜底回收：集合为空则同时 DEL 集合键与汇总键
@@ -999,8 +1018,9 @@ end
 -- 按服务器时间清理 score <= now 的到期占用，并同步维护已占用权重汇总，
 -- 返回清理后当前有效占用的权重之和。
 -- 常规路径只取出到期 member 逐笔解析权重后一次性扣减，不遍历全部有效占用；
--- 仅当"占用集合非空但缺少汇总"（升级前数据）或汇总损坏时，
--- 才在本次调用内遍历集合重建一次汇总（兼容升级前数据）。
+-- 汇总只接受非负整数字符串：缺失（升级前数据）或损坏（小数 / 负值 /
+-- 非数字内容等）时，先按服务器时间完成到期清理，再从剩余有效成员
+-- 在本次调用内重建一次整数汇总并同步兜底 TTL（兼容升级前数据）。
 -- 清理后集合为空（本次到期即全部占用）时立即 DEL 两个键，
 -- 保证集合清空与汇总失效在同一原子操作内完成。
 local function prune_slots(slot_key, used_key, now)
@@ -1017,26 +1037,24 @@ local function prune_slots(slot_key, used_key, now)
       redis.call('DEL', slot_key, used_key)
       return 0
     end
-    local stored = redis.call('GET', used_key)
-    local stored_num = stored and tonumber(stored)
-    if stored_num and stored_num >= 0 then
+    local stored_num = parse_slot_used(redis.call('GET', used_key))
+    if stored_num then
       local used = stored_num - expired_weight
       if used < 0 then used = 0 end
       -- KEEPTTL：扣减不清空汇总既有 TTL（429 / 拒绝路径不调 finalize）
       redis.call('SET', used_key, used, 'KEEPTTL')
       return used
     end
-    -- 有集合无汇总（升级前数据）或汇总损坏：本次调用内重建一次
-    local used = sum_slot_weights(slot_key)
-    redis.call('SET', used_key, used)
+    -- 有集合无汇总（升级前数据）或汇总损坏：从剩余有效成员重建一次
+    local rebuilt = sum_slot_weights(slot_key)
+    redis.call('SET', used_key, rebuilt)
     sync_used_ttl(slot_key, used_key)
-    return used
+    return rebuilt
   end
 
   -- 无到期占用：有效占用量直接读取汇总，常规请求不扫描集合
-  local stored = redis.call('GET', used_key)
-  local used = stored and tonumber(stored)
-  if used and used >= 0 then
+  local used = parse_slot_used(redis.call('GET', used_key))
+  if used then
     return used
   end
   if redis.call('ZCARD', slot_key) == 0 then
@@ -1044,11 +1062,12 @@ local function prune_slots(slot_key, used_key, now)
     redis.call('DEL', slot_key, used_key)
     return 0
   end
-  -- 汇总缺失（升级前数据）或损坏（非整数 / 负数）：在本次调用内一次性重建
-  local used = sum_slot_weights(slot_key)
-  redis.call('SET', used_key, used)
+  -- 汇总缺失（升级前数据）或损坏（小数 / 负值 / 非数字内容等）：
+  -- 在本次调用内从有效成员一次性重建
+  local rebuilt = sum_slot_weights(slot_key)
+  redis.call('SET', used_key, rebuilt)
   sync_used_ttl(slot_key, used_key)
-  return used
+  return rebuilt
 end
 """
 

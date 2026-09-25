@@ -64,7 +64,12 @@ commit-checked 与普通提交相同的凭据 / 防栅 / 幂等语义、
 申请 / 释放同步增减、到期清理逐笔扣减、集合自然过期 / 清空后汇总同步失效
 且后续申请不被旧计数阻挡（直连 Redis 构造升级前数据布局验证，
 连接地址可用 SMOKE_REDIS_HOST / SMOKE_REDIS_PORT 覆盖，键前缀用
-SMOKE_KEY_PREFIX 覆盖，默认 lease）。
+SMOKE_KEY_PREFIX 覆盖，默认 lease）；
+以及损坏汇总重建：slots-used 被写成小数（如 "1.5"）等损坏值时，
+四个容量脚本共用的清理逻辑仅接受非负整数字符串——有 / 无到期占用两种
+场景都先按服务器时间清旧、再从剩余有效成员重建整数汇总并同步兜底 TTL，
+申请 / 设置容量 / 续期 / 释放的凭据与 409/429 语义保持不变
+（直连 Redis 构造损坏数据验证）。
 """
 import json
 import os
@@ -217,6 +222,7 @@ def main():
     checked_commit_checks()
     capacity_checks()
     capacity_summary_checks()
+    capacity_corrupt_summary_checks()
 
     print()
     if FAILED:
@@ -2733,6 +2739,192 @@ def capacity_summary_checks():
               f"{code} {d3}")
         check("capsum summary after deduction",
               redis_get(used_key(rk3)) == "2", f"GET={redis_get(used_key(rk3))}")
+    finally:
+        r.close()
+
+
+def capacity_corrupt_summary_checks():
+    """损坏汇总重建回归：slots-used 被写成小数（如 "1.5"）等损坏值时，
+    四个容量脚本共用的清理逻辑仅接受非负整数字符串——先按服务器时间
+    清理到期槽位，再从剩余有效成员重建整数汇总并同步兜底 TTL；
+    申请 / 设置容量 / 续期 / 释放沿用同一口径，凭据与 409/429 语义不变。
+    （损坏数据布局无法通过公开 API 产生，直连 Redis 构造。）"""
+    base = f"smoke-capcorrupt:{int(time.time() * 1000)}"
+    prefix = os.environ.get("SMOKE_KEY_PREFIX", "lease")
+    host = os.environ.get("SMOKE_REDIS_HOST", "localhost")
+    port = int(os.environ.get("SMOKE_REDIS_PORT", "6379"))
+
+    def slots(rk):
+        return f"{prefix}:slots:{rk}"
+
+    def used_key(rk):
+        return f"{prefix}:slots-used:{rk}"
+
+    def now_ms():
+        sec, usec = r.execute("TIME")
+        return int(sec) * 1000 + int(usec) // 1000
+
+    try:
+        r = _RespClient(host, port)
+    except OSError as exc:
+        check("capcorrupt redis reachable", False, f"{host}:{port} {exc}")
+        return
+
+    try:
+        # 1) 无到期占用 + 汇总为小数：占用集合全是有效槽位，used 被写成 "1.5"。
+        #    旧实现把 1.5 当有效汇总，申请路径 INCRBY 直接报错；
+        #    修复后从剩余有效成员重建整数汇总，正常返回容量判定。
+        rk = f"{base}:valid"
+        t0 = now_ms()
+        cred_a, cred_b = "a" * 32 + ":2", "b" * 32 + ":3"
+        r.execute("ZADD", slots(rk), t0 + 60_000, cred_a)
+        r.execute("ZADD", slots(rk), t0 + 60_000, cred_b)
+        r.execute("SET", used_key(rk), "1.5")
+        code, b = call("PUT", f"/v1/capacity/{rk}", {"capacity": 10})
+        check("capcorrupt set rebuilds decimal summary",
+              code == 200 and b["configured"] and b["active_weight"] == 5,
+              f"{code} {b}")
+        check("capcorrupt summary rebuilt as integer",
+              r.execute("GET", used_key(rk)) == "5",
+              f"GET={r.execute('GET', used_key(rk))}")
+        # 成功路径 finalize 给集合键与汇总键设置相同的兜底 TTL
+        pttl_slots = r.execute("PTTL", slots(rk))
+        pttl_used = r.execute("PTTL", used_key(rk))
+        check("capcorrupt fallback ttl synced",
+              pttl_slots > 50_000 and pttl_used > 50_000
+              and abs(pttl_slots - pttl_used) <= 100,
+              f"slots={pttl_slots} used={pttl_used}")
+        # 申请：重建为整数后 INCRBY 不再报错，正常返回容量判定
+        code, a = call("POST", "/v1/capacity/slots/acquire",
+                       {"resource_key": rk, "weight": 3, "ttl_ms": 60_000})
+        check("capcorrupt acquire ok after rebuild",
+              code == 200 and a["acquired"] and a["remaining"] == 2
+              and a["active_weight"] == 8, f"{code} {a}")
+        check("capcorrupt summary incremented",
+              r.execute("GET", used_key(rk)) == "8",
+              f"GET={r.execute('GET', used_key(rk))}")
+        # 429 语义保持：剩余 2 放不下权重 3
+        code, e = call("POST", "/v1/capacity/slots/acquire",
+                       {"resource_key": rk, "weight": 3, "ttl_ms": 60_000})
+        check("capcorrupt exhausted -> 429",
+              code == 429 and e["reason"] == "capacity_exhausted"
+              and e["remaining"] == 2, f"{code} {e}")
+        # 409 语义保持：权重本身超过容量（不可重试）
+        code, e = call("POST", "/v1/capacity/slots/acquire",
+                       {"resource_key": rk, "weight": 11, "ttl_ms": 60_000})
+        check("capcorrupt oversized -> 409",
+              code == 409 and e["reason"] == "weight_exceeds_capacity",
+              f"{code} {e}")
+        # 409 below_active：下调到 4 低于有效占用 8，原配置 10 保留
+        code, b = call("PUT", f"/v1/capacity/{rk}", {"capacity": 4})
+        check("capcorrupt shrink below active -> 409",
+              code == 409 and b["reason"] == "below_active"
+              and b["capacity"] == 10 and b["active_weight"] == 8, f"{code} {b}")
+        # 凭据语义保持：真实 member 可续期，伪造凭据 409 not_found
+        code, rn = call("POST", "/v1/capacity/slots/renew",
+                        {"resource_key": rk, "credential": cred_a,
+                         "ttl_ms": 60_000})
+        check("capcorrupt renew valid credential",
+              code == 200 and rn["renewed"] and rn["remaining"] == 2,
+              f"{code} {rn}")
+        code, rn = call("POST", "/v1/capacity/slots/renew",
+                        {"resource_key": rk, "credential": "0" * 32 + ":2",
+                         "ttl_ms": 60_000})
+        check("capcorrupt renew bogus -> 409",
+              code == 409 and rn["reason"] == "not_found", f"{code} {rn}")
+        # 释放：真实 member 归还权重并扣减汇总，伪造凭据幂等忽略
+        code, rel = call("POST", "/v1/capacity/slots/release",
+                         {"resource_key": rk, "credential": cred_b})
+        check("capcorrupt release valid credential",
+              code == 200 and rel["released"] and rel["weight"] == 3
+              and rel["remaining"] == 5, f"{code} {rel}")
+        check("capcorrupt summary decremented",
+              r.execute("GET", used_key(rk)) == "5",
+              f"GET={r.execute('GET', used_key(rk))}")
+        code, rel = call("POST", "/v1/capacity/slots/release",
+                         {"resource_key": rk, "credential": "0" * 32 + ":3"})
+        check("capcorrupt release bogus ignored",
+              code == 200 and not rel["released"] and rel["remaining"] == 5,
+              f"{code} {rel}")
+        # 全部释放后集合清空：汇总键一并失效
+        call("POST", "/v1/capacity/slots/release",
+             {"resource_key": rk, "credential": cred_a})
+        code, rel = call("POST", "/v1/capacity/slots/release",
+                         {"resource_key": rk, "credential": a["credential"]})
+        check("capcorrupt release last slot",
+              code == 200 and rel["released"] and rel["remaining"] == 10,
+              f"{code} {rel}")
+        check("capcorrupt keys gone when emptied",
+              r.execute("EXISTS", slots(rk)) == 0
+              and r.execute("EXISTS", used_key(rk)) == 0,
+              f"slots={r.execute('EXISTS', slots(rk))} "
+              f"used={r.execute('EXISTS', used_key(rk))}")
+
+        # 2) 恰有到期占用 + 汇总为小数：先按服务器时间移除到期槽位，
+        #    再从剩余有效成员重建（旧实现扣减后会沿用 1.5-2 的错误值）。
+        rk2 = f"{base}:expired"
+        t0 = now_ms()
+        cred_exp, cred_live = "c" * 32 + ":2", "d" * 32 + ":3"
+        r.execute("ZADD", slots(rk2), t0 - 1_000, cred_exp)    # 已到期
+        r.execute("ZADD", slots(rk2), t0 + 60_000, cred_live)  # 仍有效
+        r.execute("SET", used_key(rk2), "1.5")
+        code, b = call("PUT", f"/v1/capacity/{rk2}", {"capacity": 10})
+        check("capcorrupt expired pruned before rebuild",
+              code == 200 and b["configured"] and b["active_weight"] == 3,
+              f"{code} {b}")
+        check("capcorrupt expired member removed",
+              r.execute("ZCARD", slots(rk2)) == 1
+              and r.execute("ZSCORE", slots(rk2), cred_live) is not None,
+              f"ZCARD={r.execute('ZCARD', slots(rk2))}")
+        check("capcorrupt expired summary rebuilt from live members",
+              r.execute("GET", used_key(rk2)) == "3",
+              f"GET={r.execute('GET', used_key(rk2))}")
+        # 申请路径同样先清旧再核算：有效 3 + 本次 3 = 6，剩余 4
+        code, a2 = call("POST", "/v1/capacity/slots/acquire",
+                        {"resource_key": rk2, "weight": 3, "ttl_ms": 60_000})
+        check("capcorrupt acquire after expired rebuild",
+              code == 200 and a2["acquired"] and a2["remaining"] == 4
+              and a2["active_weight"] == 6, f"{code} {a2}")
+        check("capcorrupt expired summary incremented",
+              r.execute("GET", used_key(rk2)) == "6",
+              f"GET={r.execute('GET', used_key(rk2))}")
+
+        # 3) 其他损坏值（tonumber 可转换但 INCRBY 拒绝的科学计数法）同样重建
+        rk3 = f"{base}:garbage"
+        t0 = now_ms()
+        r.execute("ZADD", slots(rk3), t0 + 60_000, "e" * 32 + ":2")
+        r.execute("SET", used_key(rk3), "1e3")
+        code, b3 = call("PUT", f"/v1/capacity/{rk3}", {"capacity": 5})
+        check("capcorrupt scientific-notation set rebuilds",
+              code == 200 and b3["active_weight"] == 2, f"{code} {b3}")
+        code, a3 = call("POST", "/v1/capacity/slots/acquire",
+                        {"resource_key": rk3, "weight": 1, "ttl_ms": 60_000})
+        check("capcorrupt scientific-notation summary rebuilt",
+              code == 200 and a3["acquired"] and a3["active_weight"] == 3
+              and r.execute("GET", used_key(rk3)) == "3",
+              f"{code} {a3} GET={r.execute('GET', used_key(rk3))}")
+
+        # 4) 429 拒绝路径（不调 finalize）：重建后按集合键剩余 PTTL 同步兜底 TTL
+        rk4 = f"{base}:reject-ttl"
+        t0 = now_ms()
+        r.execute("SET", f"{prefix}:capacity:{rk4}", "5")
+        r.execute("ZADD", slots(rk4), t0 + 60_000, "f" * 32 + ":2")
+        r.execute("ZADD", slots(rk4), t0 + 60_000, "1" * 32 + ":3")
+        r.execute("PEXPIRE", slots(rk4), 60_000)
+        r.execute("SET", used_key(rk4), "1.5")
+        code, e4 = call("POST", "/v1/capacity/slots/acquire",
+                        {"resource_key": rk4, "weight": 1, "ttl_ms": 60_000})
+        check("capcorrupt reject path still 429",
+              code == 429 and e4["reason"] == "capacity_exhausted"
+              and e4["remaining"] == 0, f"{code} {e4}")
+        check("capcorrupt reject path summary rebuilt",
+              r.execute("GET", used_key(rk4)) == "5",
+              f"GET={r.execute('GET', used_key(rk4))}")
+        pttl_slots = r.execute("PTTL", slots(rk4))
+        pttl_used = r.execute("PTTL", used_key(rk4))
+        check("capcorrupt reject path fallback ttl synced",
+              50_000 < pttl_used <= pttl_slots,
+              f"slots={pttl_slots} used={pttl_used}")
     finally:
         r.close()
 
