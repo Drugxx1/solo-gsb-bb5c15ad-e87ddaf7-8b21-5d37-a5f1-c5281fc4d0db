@@ -62,7 +62,11 @@ commit-checked 与普通提交相同的凭据 / 防栅 / 幂等语义、
 以及已占用权重汇总：
 升级前遗留的"有占用集合、缺汇总"数据在首次操作时于脚本内一次性重建、
 申请 / 释放同步增减、到期清理逐笔扣减、集合自然过期 / 清空后汇总同步失效
-且后续申请不被旧计数阻挡（直连 Redis 构造升级前数据布局验证，
+且后续申请不被旧计数阻挡；以及损坏汇总重建：slots-used 被写成小数等
+非非负整数字符串时（分无到期占用 / 有到期占用两种场景），四个容量脚本
+统一先按服务器时间清到期、再从剩余有效成员重建整数汇总并同步兜底 TTL，
+申请不再因 INCRBY 报错而失败，429 路径同样重建并同步 TTL
+（直连 Redis 构造升级前 / 损坏数据布局验证，
 连接地址可用 SMOKE_REDIS_HOST / SMOKE_REDIS_PORT 覆盖，键前缀用
 SMOKE_KEY_PREFIX 覆盖，默认 lease）。
 """
@@ -2621,7 +2625,9 @@ class _RespClient:
 
 def capacity_summary_checks():
     """已占用权重汇总：升级前数据一次性重建 / 申请释放同步增减 /
-    到期清理逐笔扣减 / 集合自然过期或清空后汇总失效且不被旧计数阻挡。"""
+    到期清理逐笔扣减 / 集合自然过期或清空后汇总失效且不被旧计数阻挡 /
+    汇总被写成小数等损坏值时（有无到期占用两种场景）先清到期再从剩余
+    有效成员重建整数汇总并同步兜底 TTL，申请 / 设置 / 续期 / 释放同一口径。"""
     base = f"smoke-capsum:{int(time.time() * 1000)}"
     prefix = os.environ.get("SMOKE_KEY_PREFIX", "lease")
     host = os.environ.get("SMOKE_REDIS_HOST", "localhost")
@@ -2635,6 +2641,11 @@ def capacity_summary_checks():
 
     def redis_get(key):
         return r.execute("GET", key)
+
+    def corrupt_used(rk, value):
+        # 直连 Redis 写入损坏汇总（公开 API 只会写整数）；SET 同时清掉
+        # 既有 TTL，模拟"无兜底 TTL 的损坏汇总"这一更严苛的布局
+        r.execute("SET", used_key(rk), value)
 
     try:
         r = _RespClient(host, port)
@@ -2733,6 +2744,113 @@ def capacity_summary_checks():
               f"{code} {d3}")
         check("capsum summary after deduction",
               redis_get(used_key(rk3)) == "2", f"GET={redis_get(used_key(rk3))}")
+
+        # 4) 损坏汇总重建（无到期占用）：slots-used 被写成小数 "1.5" 时，
+        #    旧实现把 tonumber 得到的小数当作有效汇总，申请路径 INCRBY 直接
+        #    报错（503）；修复后四个脚本统一只接受非负整数字符串，
+        #    损坏即重建，申请返回正常容量判定
+        rk4 = f"{base}:corrupt"
+        code, _ = call("PUT", f"/v1/capacity/{rk4}", {"capacity": 10})
+        code, c1 = call("POST", "/v1/capacity/slots/acquire",
+                        {"resource_key": rk4, "weight": 2, "ttl_ms": 60_000})
+        check("capsum corrupt setup", code == 200 and c1["acquired"],
+              f"{code} {c1}")
+        corrupt_used(rk4, "1.5")
+        # 申请：重建（2）后 INCRBY -> 3，不再报错，剩余 7
+        code, a = call("POST", "/v1/capacity/slots/acquire",
+                       {"resource_key": rk4, "weight": 1, "ttl_ms": 60_000})
+        check("capsum corrupt acquire rebuilds",
+              code == 200 and a["acquired"] and a["remaining"] == 7
+              and a["active_weight"] == 3, f"{code} {a}")
+        check("capsum corrupt summary integer",
+              redis_get(used_key(rk4)) == "3",
+              f"GET={redis_get(used_key(rk4))}")
+        check("capsum corrupt summary ttl synced",
+              r.execute("PTTL", used_key(rk4)) > 0,
+              f"PTTL={r.execute('PTTL', used_key(rk4))}")
+        # 设置容量：同一 prune 口径，损坏汇总先重建再比较
+        corrupt_used(rk4, "1.5")
+        code, b = call("PUT", f"/v1/capacity/{rk4}", {"capacity": 12})
+        check("capsum corrupt set rebuilds",
+              code == 200 and b["configured"] and b["capacity"] == 12
+              and b["active_weight"] == 3, f"{code} {b}")
+        check("capsum corrupt set summary integer",
+              redis_get(used_key(rk4)) == "3",
+              f"GET={redis_get(used_key(rk4))}")
+        # 续期：损坏汇总重建后按真实占用回算剩余（12 - 3 = 9）
+        corrupt_used(rk4, "1.5")
+        code, rn = call("POST", "/v1/capacity/slots/renew",
+                        {"resource_key": rk4, "credential": c1["credential"],
+                         "ttl_ms": 60_000})
+        check("capsum corrupt renew rebuilds",
+              code == 200 and rn["renewed"] and rn["remaining"] == 9,
+              f"{code} {rn}")
+        check("capsum corrupt renew summary integer",
+              redis_get(used_key(rk4)) == "3",
+              f"GET={redis_get(used_key(rk4))}")
+        # 释放：损坏汇总重建（3）后按该笔权重扣减 -> 1，剩余 12 - 1 = 11
+        corrupt_used(rk4, "1.5")
+        code, rel = call("POST", "/v1/capacity/slots/release",
+                         {"resource_key": rk4,
+                          "credential": c1["credential"]})
+        check("capsum corrupt release rebuilds",
+              code == 200 and rel["released"] and rel["weight"] == 2
+              and rel["remaining"] == 11, f"{code} {rel}")
+        check("capsum corrupt release summary integer",
+              redis_get(used_key(rk4)) == "1",
+              f"GET={redis_get(used_key(rk4))}")
+        # 非数字损坏值（"abc"）同样重建：剩余成员权重 1，申请 +1 -> 2
+        corrupt_used(rk4, "abc")
+        code, a = call("POST", "/v1/capacity/slots/acquire",
+                       {"resource_key": rk4, "weight": 1, "ttl_ms": 60_000})
+        check("capsum non-numeric corrupt rebuilds",
+              code == 200 and a["acquired"] and a["remaining"] == 10,
+              f"{code} {a}")
+        check("capsum non-numeric summary integer",
+              redis_get(used_key(rk4)) == "2",
+              f"GET={redis_get(used_key(rk4))}")
+
+        # 5) 损坏汇总重建（有到期占用）：先按服务器时间移除到期槽位，
+        #    再从剩余有效成员重建——损坏值不参与扣减，到期权重也不计入
+        rk5 = f"{base}:corrupt-exp"
+        code, _ = call("PUT", f"/v1/capacity/{rk5}", {"capacity": 10})
+        code, e1 = call("POST", "/v1/capacity/slots/acquire",
+                        {"resource_key": rk5, "weight": 2, "ttl_ms": 300})
+        code, e2 = call("POST", "/v1/capacity/slots/acquire",
+                        {"resource_key": rk5, "weight": 3, "ttl_ms": 60_000})
+        check("capsum corrupt-exp setup",
+              e1.get("acquired") and e2.get("acquired"), f"{e1} {e2}")
+        check("capsum corrupt-exp summary tracked",
+              redis_get(used_key(rk5)) == "5",
+              f"GET={redis_get(used_key(rk5))}")
+        time.sleep(0.7)  # 第一笔（权重 2）到期；第二笔（权重 3）仍有效
+        corrupt_used(rk5, "1.5")
+        # 重建只计剩余有效成员（3），申请 +1 -> 4，剩余 6
+        code, a = call("POST", "/v1/capacity/slots/acquire",
+                       {"resource_key": rk5, "weight": 1, "ttl_ms": 60_000})
+        check("capsum corrupt-exp acquire rebuilds",
+              code == 200 and a["acquired"] and a["remaining"] == 6
+              and a["active_weight"] == 4, f"{code} {a}")
+        check("capsum corrupt-exp summary integer",
+              redis_get(used_key(rk5)) == "4",
+              f"GET={redis_get(used_key(rk5))}")
+        check("capsum corrupt-exp expired member pruned",
+              r.execute("ZCARD", slots(rk5)) == 2,
+              f"ZCARD={r.execute('ZCARD', slots(rk5))}")
+        # 429 路径（不调 finalize）下重建同样同步兜底 TTL：
+        # 再次损坏并清掉 TTL，超限申请触发 prune 重建后返回 429
+        corrupt_used(rk5, "1.5")
+        code, headers, e = call_ex("POST", "/v1/capacity/slots/acquire",
+                                   {"resource_key": rk5, "weight": 10})
+        check("capsum corrupt-exp 429 path rebuilds",
+              code == 429 and e["reason"] == "capacity_exhausted"
+              and e["remaining"] == 6, f"{code} {e}")
+        check("capsum corrupt-exp 429 summary integer",
+              redis_get(used_key(rk5)) == "4",
+              f"GET={redis_get(used_key(rk5))}")
+        check("capsum corrupt-exp 429 ttl synced",
+              r.execute("PTTL", used_key(rk5)) > 0,
+              f"PTTL={r.execute('PTTL', used_key(rk5))}")
     finally:
         r.close()
 
